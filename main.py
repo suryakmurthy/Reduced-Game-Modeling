@@ -8,6 +8,7 @@ import matplotlib.pyplot as plt
 from solve_game_full import solve_full_lp_v_version
 from solve_game_sampling import solve_reduced_lp_using_sampling
 from solve_game_reduced import solve_reduced_lp_using_QU_vform
+from solve_game_sparse import solve_sparse_factored_lp, solve_sparse_factored_lp_saved_factors
 
 
 def parse_args():
@@ -15,14 +16,15 @@ def parse_args():
         description="Run full and reduced LP solvers on a payoff matrix."
     )
     parser.add_argument(
-        "input_matrix",
+        "--input_matrix",
+        default="settings/chess/F_d6_mw10.npy",
         type=str,
         help="Path to input .npy matrix file",
     )
     parser.add_argument(
         "--output-directory",
         type=str,
-        default="",
+        default="results/blotto",
         help="Directory to save outputs/plots",
     )
     parser.add_argument(
@@ -60,6 +62,21 @@ def parse_args():
         action="store_true",
         help="Save the plot to the output directory",
     )
+    parser.add_argument(
+        "--skip-schur",
+        action="store_true",
+        help="Save the plot to the output directory",
+    )
+    parser.add_argument(
+        "--skip-full",
+        action="store_true",
+        help="Save the plot to the output directory",
+    )
+    parser.add_argument(
+        "--use-stored",
+        action="store_true",
+        help="Save the plot to the output directory",
+    )
     return parser.parse_args()
 
 
@@ -68,6 +85,7 @@ def main():
 
     input_matrix = args.input_matrix
     output_directory = args.output_directory
+    skip_schur = args.skip_schur
     k_max = args.k_max
     seed = args.seed
     method = args.method
@@ -79,27 +97,68 @@ def main():
 
     F_raw = np.load(input_matrix)
 
-    A = F_raw - F_raw.T
+    A = F_raw
+    print(np.linalg.norm(A))
     F_true = -A
 
     print("Matrix shape:", F_true.shape)
     m, n = F_true.shape
+    if not args.skip_full:
+        ts0 = time.perf_counter()
+        res_full_one_side = solve_full_lp_v_version(F_true, method=method)
+        t_full_one_side = time.perf_counter() - ts0
 
-    ts0 = time.perf_counter()
-    res_full_one_side = solve_full_lp_v_version(F_true, method=method)
-    t_full_one_side = time.perf_counter() - ts0
+        if not res_full_one_side.success:
+            raise RuntimeError(f"Full one-sided LP failed: {res_full_one_side.message}")
 
-    if not res_full_one_side.success:
-        raise RuntimeError(f"Full one-sided LP failed: {res_full_one_side.message}")
+        y_full = res_full_one_side.x[:n].copy()
+        y_full /= y_full.sum()
 
-    y_full = res_full_one_side.x[:n].copy()
-    y_full /= y_full.sum()
+        col_lower_full = float(np.min(F_true @ y_full))
 
-    col_lower_full = float(np.min(F_true @ y_full))
+        print("\n=== Full solver (one side) diagnostics ===")
+        print(f"col_lower_full = min(F @ y_full): {col_lower_full:.6f}")
+        print(f"time: {t_full_one_side:.4f}s")
+        if args.use_stored:
+            U = np.load(f"settings/blotto/F_1000_U.npy")
+            V = np.load(f"settings/blotto/F_1000_V.npy")
+            Ahat = np.load(f"settings/blotto/F_1000_Ahat.npy")
+            res_full_one_side_sparse, U, V, Ahat, t_factor_sparse, t_solve_sparse, stats = solve_sparse_factored_lp_saved_factors(F_true, U, V, method=method)
+        else:
+            res_full_one_side_sparse, U, V, Ahat, t_factor_sparse, t_solve_sparse, stats = solve_sparse_factored_lp(F_true, method=method)
 
-    print("\n=== Full solver (one side) diagnostics ===")
-    print(f"col_lower_full = min(F @ y_full): {col_lower_full:.6f}")
-    print(f"time: {t_full_one_side:.4f}s")
+        if not res_full_one_side.success:
+            raise RuntimeError(f"Sparse LP failed: {res_full_one_side.message}")
+        
+        # Get directory of the input matrix
+        input_dir = os.path.dirname(args.input_matrix)
+
+        # Get base filename without extension
+        base_name = os.path.splitext(os.path.basename(args.input_matrix))[0]
+
+        # Build output paths
+        U_path = os.path.join(input_dir, f"{base_name}_U.npy")
+        V_path = os.path.join(input_dir, f"{base_name}_V.npy")
+        A_path = os.path.join(input_dir, f"{base_name}_Ahat.npy")
+
+        # Save matrices
+        np.save(U_path, U)
+        np.save(V_path, V)
+        np.save(A_path, Ahat)
+
+        print(f"Saved U to {U_path}")
+        print(f"Saved V to {V_path}")
+
+        y_full_sparse = res_full_one_side_sparse.x[:n].copy()
+        y_full_sparse /= y_full_sparse.sum()
+
+        col_lower_full_sparse = float(np.min(F_true @ y_full_sparse))
+
+        print("\n=== Sparse solver (one side) diagnostics ===")
+        print(f"col_lower_full = min(F @ y_full): {col_lower_full:.6f}")
+        print(f"time: {t_solve_sparse:.4f}, {t_factor_sparse:.4f}s")
+
+
 
     k_vals = []
 
@@ -113,15 +172,16 @@ def main():
         print(f"Running k={k}")
 
         # ---- Schur baseline ----
-        res, Qr, Ur, t_solve, t_setup, c_r = solve_reduced_lp_using_QU_vform(
-            F_true, k, p=p, q=q, seed=seed, method=method
-        )
+        if not skip_schur:
+            res, Qr, Ur, t_solve, t_setup, c_r = solve_reduced_lp_using_QU_vform(
+                F_true, k, p=p, q=q, seed=seed, method=method
+            )
 
-        if not res.success:
-            print(f"Schur FAIL at k={k}")
-            print("status:", res.status)
-            print("message:", res.message)
-            continue
+            if not res.success:
+                print(f"Schur FAIL at k={k}")
+                print("status:", res.status)
+                print("message:", res.message)
+                continue
 
         # ---- Sampling baseline ----
         (
@@ -139,16 +199,17 @@ def main():
             continue
 
         # ---- Evaluate Schur solution ----
-        yk = res.x[:n].copy()
-        s = yk.sum()
-        if s <= 0:
-            print(f"Schur returned nonpositive mass at k={k}")
-            continue
-        yk /= s
+        if not skip_schur:
+            yk = res.x[:n].copy()
+            s = yk.sum()
+            if s <= 0:
+                print(f"Schur returned nonpositive mass at k={k}")
+                continue
+            yk /= s
 
-        col_lower = float(np.min(F_true @ yk))
-        col_lower_series.append(col_lower)
-        times.append(t_solve + t_setup)
+            col_lower = float(np.min(F_true @ yk))
+            col_lower_series.append(col_lower)
+            times.append(t_solve + t_setup)
 
         # ---- Evaluate sampled solution ----
         col_lower_sampling = float(np.min(F_true @ yk_sampling))
@@ -164,7 +225,8 @@ def main():
     fig.suptitle("Reduced Rank LP — Solver Analysis", fontsize=13)
 
     ax = axes[0, 0]
-    ax.plot(k_vals, col_lower_series, marker="o", markersize=3, label="Schur")
+    if not skip_schur:
+        ax.plot(k_vals, col_lower_series, marker="o", markersize=3, label="Schur")
     ax.plot(
         k_vals,
         col_lower_series_sampling,
@@ -173,13 +235,21 @@ def main():
         color="green",
         label="Sampling",
     )
-    ax.axhline(
-        col_lower_full,
-        linewidth=1.5,
-        linestyle="--",
-        color="red",
-        label="Full LP (one-side)",
-    )
+    if not args.skip_full:
+        ax.axhline(
+            col_lower_full,
+            linewidth=1.5,
+            linestyle="--",
+            color="red",
+            label="Full LP",
+        )
+        ax.axhline(
+            col_lower_full_sparse,
+            linewidth=1.5,
+            linestyle="--",
+            color="purple",
+            label="Sparse LP",
+        )
     ax.set_xlabel("k")
     ax.set_ylabel("Lower bound")
     ax.set_title("Exploitability Lower Bound")
@@ -187,7 +257,8 @@ def main():
     ax.legend()
 
     ax = axes[1, 0]
-    ax.plot(k_vals, times, marker="o", markersize=3, label="Schur solver")
+    if not skip_schur:
+        ax.plot(k_vals, times, marker="o", markersize=3, label="Schur solver")
     ax.plot(
         k_vals,
         times_sampling,
@@ -196,13 +267,21 @@ def main():
         color="green",
         label="Sampling solver",
     )
-    ax.axhline(
-        t_full_one_side,
-        linewidth=1.5,
-        linestyle="--",
-        color="red",
-        label="Full solver",
-    )
+    if not args.skip_full:
+        ax.axhline(
+            t_full_one_side,
+            linewidth=1.5,
+            linestyle="--",
+            color="red",
+            label="Full solver",
+        )
+        ax.axhline(
+            t_solve_sparse,
+            linewidth=1.5,
+            linestyle="--",
+            color="orange",
+            label="Sparse LP Solve",
+        )
     ax.set_xlabel("k")
     ax.set_ylabel("Time (s)")
     ax.set_title("Solve Time vs k")
@@ -213,7 +292,7 @@ def main():
 
 
     if args.save_plot:
-        plot_path = os.path.join(output_directory, "solver_analysis.png") \
+        plot_path = os.path.join(output_directory, f"solver_analysis.png") \
             if output_directory else "solver_analysis.png"
         plt.savefig(plot_path, dpi=200, bbox_inches="tight")
         print(f"\nSaved plot to {plot_path}")

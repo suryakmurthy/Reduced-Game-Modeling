@@ -75,6 +75,7 @@ def topk_schur_from_F_power(F, k, p=10, q=5, seed=0):
     U : (n, r)   approximate Schur vectors
     D : (r, r)   real Schur form (skew-symmetric block diagonal)
     """
+    # print("Checkpoint 2")
     n = F.shape[0]
     k = min(k, n // 2)
     r = min(n, 2 * k + p)
@@ -84,7 +85,8 @@ def topk_schur_from_F_power(F, k, p=10, q=5, seed=0):
     V = rng.standard_normal((n, r))
     V, _ = la.qr(V, mode="economic")
 
-    for _ in range(q):
+    for q_i in range(q):
+        print(q_i, q)
         V = F @ (F.T @ V)
         V, _ = la.qr(V, mode="economic")
 
@@ -93,7 +95,7 @@ def topk_schur_from_F_power(F, k, p=10, q=5, seed=0):
 
     D, W = la.schur(B, output="real")
     U = V @ W
-
+    # print("Checkpoint 3")
     return U, D
 
 
@@ -105,6 +107,7 @@ def solve_reduced_lp_using_QU_vform(
     verbose=False
 ):
     t0 = time.perf_counter()
+    # print("Checkpoint 1")
 
     Qr, Ur = topk_schur_from_F_power(F, k=k_nominal, p=p, q=q, seed=seed)
     n = F.shape[0]
@@ -140,6 +143,7 @@ def solve_reduced_lp_using_QU_vform(
         return Dummy(), Qr, Ur, 0.0, t_setup, 0.0
 
     QU = Qr @ Ur
+    # print("Checkpoint 4")
 
     c_r = 0.0
     if use_shift:
@@ -150,6 +154,7 @@ def solve_reduced_lp_using_QU_vform(
     nvar = n + r + 1
     c = np.zeros(nvar)
     c[n + r] = 1.0
+    # print("Checkpoint 5")
 
     A_eq = np.zeros((1 + r, nvar))
     b_eq = np.zeros(1 + r)
@@ -157,6 +162,7 @@ def solve_reduced_lp_using_QU_vform(
     b_eq[0] = 1.0
     A_eq[1:, :n] = -Qr.T
     A_eq[1:, n:n + r] = np.eye(r)
+    # print("Checkpoint 6")
 
     A_ub = np.zeros((n, nvar))
     b_ub = np.zeros(n)
@@ -167,7 +173,7 @@ def solve_reduced_lp_using_QU_vform(
     bounds = [(0.0, float(x_ub))] * n + [(None, None)] * r + [(None, None)]
 
     t_setup = time.perf_counter() - t0
-
+    # print("Checkpoint 7")
     ts0 = time.perf_counter()
     res = linprog(
         c, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq,
