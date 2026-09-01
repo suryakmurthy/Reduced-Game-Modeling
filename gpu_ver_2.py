@@ -1,6 +1,5 @@
 import numpy as np
 import torch
-from collections import Counter
 from scipy.optimize import linprog
 import time
 import os
@@ -36,7 +35,7 @@ def _normalize_rank1(u, v, zero_tol=1e-12):
 # Algorithm 4 (GPU core)
 # ---------------------------------------------------------------------------
 
-def _best_v_given_u_l0_gpu(A, u, zero_tol=1e-12, round_decimals=10):
+def _best_v_given_u_l0_gpu(A, u, zero_tol=1e-12, cluster_tol=1e-6):
     m, n = A.shape
     device = A.device
 
@@ -55,19 +54,18 @@ def _best_v_given_u_l0_gpu(A, u, zero_tol=1e-12, round_decimals=10):
     ratios = A_nz / u_nz[:, None]
     nonzero_mask = torch.abs(A_nz) > zero_tol
 
-    scale = 10 ** round_decimals
-    ratios = torch.round(ratios * scale) / scale
-
-    # unavoidable CPU step (mode)
+    # Move to CPU for clustering
     ratios_cpu = ratios.cpu().numpy()
     mask_cpu = nonzero_mask.cpu().numpy()
+    u_cpu = u_nz.cpu().numpy()
+    A_cpu = A_nz.cpu().numpy()
 
     for j in range(n):
-        # print("Iterating 3", j, n)
         vals = ratios_cpu[mask_cpu[:, j], j]
         if vals.size == 0:
             continue
 
+        # Find mode via unique (no rounding)
         unique, counts = np.unique(vals, return_counts=True)
         idx = np.argmax(counts)
 
@@ -76,7 +74,20 @@ def _best_v_given_u_l0_gpu(A, u, zero_tol=1e-12, round_decimals=10):
         nonzero_count = vals.size
 
         if count > ku - nonzero_count:
-            v[j] = float(mode_val)
+            # tolerance-based cluster
+            full_vals = ratios_cpu[:, j]
+            mask_col = mask_cpu[:, j]
+
+            close_mask = np.abs(full_vals - mode_val) < cluster_tol
+            cluster_mask = mask_col & close_mask
+
+            if np.any(cluster_mask):
+                u_vals = u_cpu[cluster_mask]
+                a_vals = A_cpu[cluster_mask, j]
+
+                denom = np.dot(u_vals, u_vals)
+                if denom > zero_tol:
+                    v[j] = float(np.dot(u_vals, a_vals) / denom)
 
     return v
 
@@ -94,7 +105,6 @@ def _altmin_rank1_l0_gpu(
     max_inner_iters=20,
     seed=0,
     zero_tol=1e-12,
-    round_decimals=10,
 ):
     m, n = A.shape
     device = A.device
@@ -113,16 +123,15 @@ def _altmin_rank1_l0_gpu(
 
     for iter_inner in range(max_inner_iters):
         print("Iterating 2: ", iter_inner, max_inner_iters)
+
         v = _best_v_given_u_l0_gpu(
             A, u,
-            zero_tol=zero_tol,
-            round_decimals=round_decimals
+            zero_tol=zero_tol
         )
 
         u = _best_u_given_v_l0_gpu(
             A, v,
-            zero_tol=zero_tol,
-            round_decimals=round_decimals
+            zero_tol=zero_tol
         )
 
         u, v = _normalize_rank1(u, v, zero_tol=zero_tol)
@@ -135,7 +144,7 @@ def _altmin_rank1_l0_gpu(
             best_u = u.clone()
             best_v = v.clone()
         else:
-            break
+            continue  # <-- IMPORTANT FIX (no early break)
 
     return best_u, best_v, best_obj
 
@@ -175,6 +184,7 @@ def sparse_factorize_l0_gpu(
 
     for outer_iter in range(min(max_outer_iters, max_rank)):
         print("Iterating outer: ", outer_iter, min(max_outer_iters, max_rank))
+
         u, v, cand_nnz = _altmin_rank1_l0_gpu(
             A,
             max_inner_iters=max_inner_iters,
@@ -186,6 +196,8 @@ def sparse_factorize_l0_gpu(
         kv = torch.count_nonzero(torch.abs(v) > zero_tol).item()
 
         improvement = prev_nnz - cand_nnz
+
+        print(f"ku={ku}, kv={kv}, improvement={improvement}")
 
         if ku <= 1 or kv <= 1 or improvement < min_improvement:
             unsuccessful += 1
@@ -219,11 +231,12 @@ def sparse_factorize_l0_gpu(
 
     return U, V, Ahat, stats
 
+
 # ---------------------------------------------------------------------------
-# LP solvers
+# LP solvers — scipy (original implementations, kept for reference)
 # ---------------------------------------------------------------------------
 
-def solve_full_lp(F, x_ub=1.0, method="highs-ipm"):
+def solve_full_lp_scipy(F, x_ub=1.0, method="highs-ipm"):
     """
     Solve the row-player LP without factorisation (baseline).
 
@@ -252,7 +265,7 @@ def solve_full_lp(F, x_ub=1.0, method="highs-ipm"):
                    bounds=bounds, method=method)
 
 
-def solve_sparse_factored_lp(
+def solve_sparse_factored_lp_scipy(
     F,
     x_ub=1.0,
     method="highs-ipm",
@@ -264,7 +277,7 @@ def solve_sparse_factored_lp(
     max_rank=None,
 ):
     """
-    Solve the row-player LP using the factored form A = Ahat + U V^T.
+    Solve the row-player LP using the factored form A = Ahat + U V^T (scipy backend).
 
     Reformulated LP (Section 4 of the paper), introducing w = U^T x:
 
@@ -302,7 +315,7 @@ def solve_sparse_factored_lp(
     # If no useful factorisation found, fall back to the full LP
     if r == 0:
         t1 = time.perf_counter()
-        res = solve_full_lp(F, x_ub=x_ub, method=method)
+        res = solve_full_lp_scipy(F, x_ub=x_ub, method=method)
         return res, U, V, Ahat, t_factor, time.perf_counter() - t1, stats
 
     # Variables: [x (m), w (r), t (1)]
@@ -339,19 +352,15 @@ def solve_sparse_factored_lp(
 
     return res, U, V, Ahat, t_factor, t_solve, stats
 
-def solve_sparse_factored_lp_saved_factors(
-    F, U, V,
+
+def solve_sparse_factored_lp_saved_factors_scipy(
+    F, U, V, Ahat,
     x_ub=1.0,
     method="highs-ipm",
-    max_outer_iters=100,
-    max_inner_iters=10,
-    seed=0,
     zero_tol=1e-10,
-    min_improvement=5,
-    max_rank=None,
 ):
     """
-    Solve the row-player LP using the factored form A = Ahat + U V^T.
+    Solve the row-player LP using pre-computed factors (scipy backend).
 
     Reformulated LP (Section 4 of the paper), introducing w = U^T x:
 
@@ -364,24 +373,18 @@ def solve_sparse_factored_lp_saved_factors(
 
     Returns
     -------
-    res        : linprog result (res.x[:m] is the row-player strategy,
-                 -res.fun is the game value)
-    U, V, Ahat : factorisation components
-    t_factor   : wall-clock time for factorisation
-    t_solve    : wall-clock time for LP solve
-    stats      : factorisation statistics
+    res     : linprog result (res.x[:m] is the row-player strategy,
+              -res.fun is the game value)
+    t_solve : wall-clock time for LP solve
     """
-
-
     m, n = F.shape
     r = U.shape[1]
-    # If no useful factorisation found, fall back to the full LP
+
     if r == 0:
         t1 = time.perf_counter()
-        res = solve_full_lp(F, x_ub=x_ub, method=method)
-        return res, U, V, Ahat, 0, time.perf_counter() - t1, stats
+        res = solve_full_lp_scipy(F, x_ub=x_ub, method=method)
+        return res, U, V, Ahat, 0, time.perf_counter() - t1, {}
 
-    # Variables: [x (m), w (r), t (1)]
     nvar = m + r + 1
     c = np.zeros(nvar)
     c[-1] = 1.0
@@ -413,8 +416,281 @@ def solve_sparse_factored_lp_saved_factors(
     )
     t_solve = time.perf_counter() - t1
 
-    return res, U, V, Ahat, 0, t_solve, stats
+    return res, U, V, Ahat, 0, t_solve, {}
 
+
+# ---------------------------------------------------------------------------
+# LP solvers — Gurobi
+# ---------------------------------------------------------------------------
+# method argument mapping:
+#   0  →  primal simplex   (GRB.METHOD_PRIMAL  = 0)
+#   1  →  dual simplex     (GRB.METHOD_DUAL    = 1)
+#   2  →  barrier / IPM    (GRB.METHOD_BARRIER = 2)
+# ---------------------------------------------------------------------------
+
+def _make_gurobi_result(model, x_vars, m):
+    """
+    Package a Gurobi solution into a lightweight namespace that mirrors the
+    scipy linprog result so callers can treat both backends uniformly.
+
+    Attributes mirrored
+    -------------------
+    success : bool
+    status  : int   (0 = optimal, 2 = infeasible, 3 = unbounded, 1 = other)
+    message : str
+    fun     : float   (objective value)
+    x       : np.ndarray  (full variable vector)
+    """
+    import gurobipy as gp
+    from types import SimpleNamespace
+
+    STATUS_MAP = {
+        gp.GRB.OPTIMAL:    (True,  0, "Optimization terminated successfully (Gurobi)."),
+        gp.GRB.INFEASIBLE: (False, 2, "The problem is infeasible."),
+        gp.GRB.UNBOUNDED:  (False, 3, "The problem is unbounded."),
+    }
+    success, status, message = STATUS_MAP.get(
+        model.Status, (False, 1, f"Gurobi status code {model.Status}.")
+    )
+
+    obj = model.ObjVal if success else float("nan")
+    xvals = np.array([v.X for v in x_vars]) if success else np.full(len(x_vars), float("nan"))
+
+    return SimpleNamespace(success=success, status=status, message=message,
+                           fun=obj, x=xvals)
+
+
+def solve_full_lp(F, x_ub=1.0, method=2):
+    """
+    Solve the row-player LP without factorisation (Gurobi backend).
+
+    max_{x,t} t   s.t.  F^T x >= t·1,  sum(x)=1,  x>=0
+
+    Parameters
+    ----------
+    F      : (m, n) payoff matrix
+    x_ub   : upper bound on each x_i  (default 1.0)
+    method : Gurobi Method parameter
+               0 → primal simplex
+               1 → dual simplex
+               2 → barrier / IPM  (default)
+
+    Returns
+    -------
+    result namespace with .x, .fun, .success  (mirrors scipy linprog output)
+    """
+    import gurobipy as gp
+    from gurobipy import GRB
+
+    m, n = F.shape
+
+    with gp.Env(empty=True) as env:
+        env.setParam("OutputFlag", 0)
+        env.start()
+
+        with gp.Model(env=env) as model:
+            model.Params.Method = method
+
+            # Variables
+            x = model.addMVar(m, lb=0.0, ub=float(x_ub), name="x")
+            # Use MVar(1) so t participates cleanly in MVar matrix expressions
+            t = model.addMVar(1, lb=-GRB.INFINITY, ub=GRB.INFINITY, name="t")
+
+            # Objective: maximise t  →  minimise -t
+            model.setObjective(-np.ones(1) @ t, GRB.MINIMIZE)
+
+            # F^T x >= t·1  →  F^T x - np.ones((n,1)) @ t >= 0
+            model.addConstr(F.T @ x - np.ones((n, 1)) @ t >= np.zeros(n), name="game")
+
+            # sum(x) = 1
+            model.addConstr(x.sum() == 1.0, name="simplex")
+
+            model.optimize()
+
+            all_vars = list(x.tolist()) + list(t.tolist())
+            return _make_gurobi_result(model, all_vars, m)
+
+
+def solve_sparse_factored_lp(
+    F,
+    x_ub=1.0,
+    method=2,
+    max_outer_iters=100,
+    max_inner_iters=10,
+    seed=0,
+    zero_tol=1e-10,
+    min_improvement=5,
+    max_rank=None,
+):
+    """
+    Solve the row-player LP using the factored form A = Ahat + U V^T
+    (Gurobi backend).
+
+    Reformulated LP (Section 4 of the paper), introducing w = U^T x:
+
+        min_{x, w, t}  -t
+        s.t.
+          Ahat^T x + V w - t·1_n  <=  0      [n inequalities]
+          sum(x)                   =   1       [1 equality]
+          U^T x  -  w              =   0       [r equalities]
+          x >= 0,  w and t free
+
+    Parameters
+    ----------
+    method : Gurobi Method parameter
+               0 → primal simplex
+               1 → dual simplex
+               2 → barrier / IPM  (default)
+
+    Returns
+    -------
+    res        : result namespace (res.x[:m] is the row-player strategy,
+                 -res.fun is the game value)
+    U, V, Ahat : factorisation components
+    t_factor   : wall-clock time for factorisation
+    t_solve    : wall-clock time for LP solve
+    stats      : factorisation statistics
+    """
+    import gurobipy as gp
+    from gurobipy import GRB
+
+    t0 = time.perf_counter()
+    U, V, Ahat, stats = sparse_factorize_l0_gpu(
+        F,
+        max_outer_iters=max_outer_iters,
+        max_inner_iters=max_inner_iters,
+        seed=seed,
+        zero_tol=zero_tol,
+        min_improvement=min_improvement,
+        max_rank=max_rank,
+    )
+    t_factor = time.perf_counter() - t0
+
+    m, n = F.shape
+    r = U.shape[1]
+
+    # No useful factorisation — fall back to the full LP
+    if r == 0:
+        t1 = time.perf_counter()
+        res = solve_full_lp(F, x_ub=x_ub, method=method)
+        return res, U, V, Ahat, t_factor, time.perf_counter() - t1, stats
+
+    with gp.Env(empty=True) as env:
+        env.setParam("OutputFlag", 0)
+        env.start()
+
+        with gp.Model(env=env) as model:
+            model.Params.Method = method
+
+            # Variables: x (m), w (r), t (1)
+            x = model.addMVar(m, lb=0.0, ub=float(x_ub), name="x")
+            w = model.addMVar(r, lb=-GRB.INFINITY, name="w")
+            # Use MVar(1) so t participates cleanly in MVar matrix expressions
+            t = model.addMVar(1, lb=-GRB.INFINITY, ub=GRB.INFINITY, name="t")
+
+            # Objective: maximise t  →  minimise -t
+            model.setObjective(-np.ones(1) @ t, GRB.MINIMIZE)
+
+            # Ahat^T x + V w - t·1 <= 0
+            model.addConstr(
+                Ahat.T @ x + V @ w - np.ones((n, 1)) @ t <= np.zeros(n),
+                name="game"
+            )
+
+            # sum(x) = 1
+            model.addConstr(x.sum() == 1.0, name="simplex")
+
+            # U^T x - w = 0
+            model.addConstr(U.T @ x - w == np.zeros(r), name="factor")
+
+            t1 = time.perf_counter()
+            model.optimize()
+            t_solve = time.perf_counter() - t1
+
+            all_vars = list(x.tolist()) + list(w.tolist()) + list(t.tolist())
+            res = _make_gurobi_result(model, all_vars, m)
+
+    return res, U, V, Ahat, t_factor, t_solve, stats
+
+
+def solve_sparse_factored_lp_saved_factors(
+    F, U, V, Ahat,
+    x_ub=1.0,
+    method=2,
+    zero_tol=1e-10,
+):
+    """
+    Solve the row-player LP using pre-computed factors (Gurobi backend).
+
+    Reformulated LP (Section 4 of the paper), introducing w = U^T x:
+
+        min_{x, w, t}  -t
+        s.t.
+          Ahat^T x + V w - t·1_n  <=  0      [n inequalities]
+          sum(x)                   =   1       [1 equality]
+          U^T x  -  w              =   0       [r equalities]
+          x >= 0,  w and t free
+
+    Parameters
+    ----------
+    method : Gurobi Method parameter
+               0 → primal simplex
+               1 → dual simplex
+               2 → barrier / IPM  (default)
+
+    Returns
+    -------
+    res     : result namespace (res.x[:m] is the row-player strategy,
+              -res.fun is the game value)
+    t_solve : wall-clock time for LP solve
+    """
+    import gurobipy as gp
+    from gurobipy import GRB
+
+    m, n = F.shape
+    r = U.shape[1]
+
+    if r == 0:
+        t1 = time.perf_counter()
+        res = solve_full_lp(F, x_ub=x_ub, method=method)
+        return res, U, V, Ahat, 0, time.perf_counter() - t1, {}
+
+    with gp.Env(empty=True) as env:
+        env.setParam("OutputFlag", 0)
+        env.start()
+
+        with gp.Model(env=env) as model:
+            model.Params.Method = method
+
+            # Variables: x (m), w (r), t (1)
+            x = model.addMVar(m, lb=0.0, ub=float(x_ub), name="x")
+            w = model.addMVar(r, lb=-GRB.INFINITY, name="w")
+            # Use MVar(1) so t participates cleanly in MVar matrix expressions
+            t = model.addMVar(1, lb=-GRB.INFINITY, ub=GRB.INFINITY, name="t")
+
+            # Objective: maximise t  →  minimise -t
+            model.setObjective(-np.ones(1) @ t, GRB.MINIMIZE)
+
+            # Ahat^T x + V w - t·1 <= 0
+            model.addConstr(
+                Ahat.T @ x + V @ w - np.ones((n, 1)) @ t <= np.zeros(n),
+                name="game"
+            )
+
+            # sum(x) = 1
+            model.addConstr(x.sum() == 1.0, name="simplex")
+
+            # U^T x - w = 0
+            model.addConstr(U.T @ x - w == np.zeros(r), name="factor")
+
+            t1 = time.perf_counter()
+            model.optimize()
+            t_solve = time.perf_counter() - t1
+
+            all_vars = list(x.tolist()) + list(w.tolist()) + list(t.tolist())
+            res = _make_gurobi_result(model, all_vars, m)
+
+    return res, U, V, Ahat, 0, t_solve, {}
 
 
 # ---------------------------------------------------------------------------
@@ -438,7 +714,7 @@ if __name__ == "__main__":
     print("Running GPU factorization...")
     U, V, Ahat, stats = sparse_factorize_l0_gpu(
         A,
-        max_outer_iters=50,
+        max_outer_iters=10,
         min_improvement=1
     )
     # Save matrices

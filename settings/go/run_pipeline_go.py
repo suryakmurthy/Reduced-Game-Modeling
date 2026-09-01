@@ -1,9 +1,9 @@
 import os
 import numpy as np
 
-from line_enumerator_go import GoLineEnumerator
-from katago_evaluator import KataGoEvaluator
-from payoff_matrix_go import (
+from old_version.settings.go.line_enumerator_go import GoLineEnumerator
+from old_version.settings.go.katago_evaluator import KataGoEvaluator
+from old_version.settings.go.payoff_matrix_go import (
     build_F_matrix,
     build_payoff_matrix,
     svd_analysis,

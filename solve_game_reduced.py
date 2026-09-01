@@ -2,6 +2,10 @@ import numpy as np
 from scipy.optimize import linprog
 import time
 import scipy.linalg as la
+import gurobipy as gp
+from gurobipy import GRB
+
+# Stochastic vs Deterministic? (Regret Matching etc.)
 
 def truncate_schur_by_omega(Qr, Ur, omega_abs_tol=None, omega_rel_tol=None):
     """
@@ -86,7 +90,7 @@ def topk_schur_from_F_power(F, k, p=10, q=5, seed=0):
     V, _ = la.qr(V, mode="economic")
 
     for q_i in range(q):
-        print(q_i, q)
+        # print(q_i, q)
         V = F @ (F.T @ V)
         V, _ = la.qr(V, mode="economic")
 
@@ -100,6 +104,100 @@ def topk_schur_from_F_power(F, k, p=10, q=5, seed=0):
 
 
 def solve_reduced_lp_using_QU_vform(
+    F, k_nominal, p=10, q=3, seed=0, method=1,
+    x_ub=1.0,
+    use_shift=True, eps_shift=1e-6,
+    omega_abs_tol=None, omega_rel_tol=None,
+    verbose=False
+):
+    t0 = time.perf_counter()
+
+    Qr, Ur = topk_schur_from_F_power(F, k=k_nominal, p=p, q=q, seed=seed)
+    n = F.shape[0]
+
+    Qr, Ur, omegas_all, keep_mask = truncate_schur_by_omega(
+        Qr, Ur,
+        omega_abs_tol=omega_abs_tol,
+        omega_rel_tol=omega_rel_tol
+    )
+    r = Qr.shape[1]
+
+    if r == 0:
+        x = np.ones(n) / n
+
+        class Dummy:
+            success = True
+            status = 0
+            message = "All Schur blocks truncated; returned uniform x."
+            x = np.concatenate([x, np.array([]), np.array([0.0])])
+
+        t_setup = time.perf_counter() - t0
+        return Dummy(), Qr, Ur, 0.0, t_setup, 0.0
+
+    QU = Qr @ Ur
+
+    c_r = 0.0
+    if use_shift:
+        Fr = Qr @ Ur @ Qr.T
+        min_entry = np.min(Fr)
+        c_r = max(0.0, -min_entry + eps_shift)
+
+    nvar = n + r + 1
+
+    # ---------------- Gurobi model ----------------
+    model = gp.Model("reduced_lp")
+    model.setParam("OutputFlag", 0)  # silence
+    model.setParam("Method", method)
+
+
+    # Variables
+    x = model.addVars(n, lb=0.0, ub=x_ub, name="x")
+    y = model.addVars(r, lb=-GRB.INFINITY, name="y")
+    t = model.addVar(lb=-GRB.INFINITY, name="t")
+
+    # Objective: minimize t
+    model.setObjective(t, GRB.MINIMIZE)
+
+    # Equality constraints
+    model.addConstr(gp.quicksum(x[i] for i in range(n)) == 1.0)
+
+    for j in range(r):
+        model.addConstr(
+            -gp.quicksum(Qr[i, j] * x[i] for i in range(n)) + y[j] == 0
+        )
+
+    # Inequality constraints
+    for i in range(n):
+        model.addConstr(
+            -gp.quicksum(QU[i, j] * y[j] for j in range(r)) - t <= -c_r
+        )
+
+    t_setup = time.perf_counter() - t0
+
+    ts0 = time.perf_counter()
+    model.optimize()
+    t_solve = time.perf_counter() - ts0
+
+    # Pack result similar to scipy
+    class Result:
+        pass
+
+    res = Result()
+    res.success = model.status == GRB.OPTIMAL
+    res.status = model.status
+    res.message = model.Status
+
+    if res.success:
+        x_vals = np.array([x[i].X for i in range(n)])
+        y_vals = np.array([y[j].X for j in range(r)])
+        t_val = t.X
+        res.x = np.concatenate([x_vals, y_vals, np.array([t_val])])
+    else:
+        res.x = None
+
+    return res, Qr, Ur, t_solve, t_setup, c_r
+
+def solve_reduced_lp_using_QU_vform_scipy(
     F, k_nominal, p=10, q=3, seed=0,
     x_ub=1.0, method="highs-ipm",
     use_shift=True, eps_shift=1e-6,

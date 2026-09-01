@@ -3,9 +3,9 @@ import matplotlib.pyplot as plt
 import os
 import time
 
-from line_enumerator import PolyglotLineEnumerator
-from lc0_evaluator import LC0Evaluator
-from payoff_matrix import build_payoff_matrix, svd_analysis, nash_equilibrium
+from old_version.settings.chess.line_enumerator import PolyglotLineEnumerator
+from old_version.settings.chess.lc0_evaluator import LC0Evaluator
+from old_version.settings.chess.payoff_matrix import build_payoff_matrix, svd_analysis, nash_equilibrium
 
 # ------------------------------------------------------------------
 # Configuration

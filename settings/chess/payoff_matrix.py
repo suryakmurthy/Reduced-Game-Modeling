@@ -3,7 +3,7 @@ import os
 from typing import List, Tuple, Optional
 from tqdm import tqdm
 
-from lc0_evaluator import LC0Evaluator
+from old_version.settings.chess.lc0_evaluator import LC0Evaluator
 
 
 # ------------------------------------------------------------------
@@ -194,7 +194,7 @@ def nash_equilibrium(A: np.ndarray) -> np.ndarray:
 # Quick test
 # ------------------------------------------------------------------
 if __name__ == "__main__":
-    from line_enumerator import PolyglotLineEnumerator
+    from old_version.settings.chess.line_enumerator import PolyglotLineEnumerator
 
     enumerator = PolyglotLineEnumerator("gm2001.bin", min_weight=500)
     lines = enumerator.enumerate(depth=6)

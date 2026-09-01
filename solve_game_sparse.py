@@ -16,6 +16,8 @@ import numpy as np
 from collections import Counter
 from scipy.optimize import linprog
 import time
+import gurobipy as gp
+from gurobipy import GRB
 
 
 # ---------------------------------------------------------------------------
@@ -59,7 +61,7 @@ def _best_v_given_u_l0(A, u, zero_tol=1e-12, round_decimals=10):
         return v
 
     for j in range(n):
-        print("Iterating 3: ", j, n)
+        # print("Iterating 3: ", j, n)
         vals = []
         nonzero_count = 0  # = len(q[j]) in the paper's notation
 
@@ -251,7 +253,52 @@ def sparse_factorize_l0(
 # LP solvers
 # ---------------------------------------------------------------------------
 
-def solve_full_lp(F, x_ub=1.0, method="highs-ipm"):
+def solve_full_lp(F, x_ub=1.0):
+    m, n = F.shape
+
+    model = gp.Model("full_lp")
+    model.setParam("OutputFlag", 0)
+
+    # Variables
+    if x_ub is None:
+        x = model.addVars(m, lb=0.0, ub=GRB.INFINITY)
+    else:
+        x = model.addVars(m, lb=0.0, ub=float(x_ub))
+
+    t = model.addVar(lb=-GRB.INFINITY)
+
+    # Objective: maximize t
+    model.setObjective(t, GRB.MAXIMIZE)
+
+    # sum x = 1
+    model.addConstr(gp.quicksum(x[i] for i in range(m)) == 1.0)
+
+    # F^T x >= t
+    for j in range(n):
+        model.addConstr(
+            gp.quicksum(F[i, j] * x[i] for i in range(m)) >= t
+        )
+
+    model.optimize()
+
+    class Result: pass
+    res = Result()
+
+    res.success = model.status == GRB.OPTIMAL
+    res.status = model.status
+
+    if res.success:
+        x_vals = np.array([x[i].X for i in range(m)])
+        t_val = t.X
+        res.x = np.concatenate([x_vals, [t_val]])
+        res.fun = -t_val  # match scipy convention
+    else:
+        res.x = None
+        res.fun = None
+
+    return res
+
+def solve_full_lp_scipy(F, x_ub=1.0, method="highs-ipm"):
     """
     Solve the row-player LP without factorisation (baseline).
 
@@ -279,8 +326,92 @@ def solve_full_lp(F, x_ub=1.0, method="highs-ipm"):
                    A_eq=A_eq, b_eq=b_eq,
                    bounds=bounds, method=method)
 
-
 def solve_sparse_factored_lp(
+    F,
+    x_ub=1.0,
+    max_outer_iters=100,
+    max_inner_iters=10,
+    seed=0,
+    zero_tol=1e-10,
+    min_improvement=5,
+    max_rank=None,
+):
+    t0 = time.perf_counter()
+
+    U, V, Ahat, stats = sparse_factorize_l0(
+        F,
+        max_outer_iters=max_outer_iters,
+        max_inner_iters=max_inner_iters,
+        seed=seed,
+        zero_tol=zero_tol,
+        min_improvement=min_improvement,
+        max_rank=max_rank,
+    )
+    t_factor = time.perf_counter() - t0
+
+    m, n = F.shape
+    r = U.shape[1]
+
+    if r == 0:
+        t1 = time.perf_counter()
+        res = solve_full_lp(F, x_ub=x_ub)
+        return res, U, V, Ahat, t_factor, time.perf_counter() - t1, stats
+
+    model = gp.Model("factored_lp")
+    model.setParam("OutputFlag", 0)
+
+    # Variables
+    if x_ub is None:
+        x = model.addVars(m, lb=0.0, ub=GRB.INFINITY)
+    else:
+        x = model.addVars(m, lb=0.0, ub=float(x_ub))
+
+    w = model.addVars(r, lb=-GRB.INFINITY)
+    t = model.addVar(lb=-GRB.INFINITY)
+
+    # Objective: maximize t
+    model.setObjective(t, GRB.MAXIMIZE)
+
+    # sum(x) = 1
+    model.addConstr(gp.quicksum(x[i] for i in range(m)) == 1.0)
+
+    # U^T x - w = 0
+    for j in range(r):
+        model.addConstr(
+            gp.quicksum(U[i, j] * x[i] for i in range(m)) == w[j]
+        )
+
+    # Ahat^T x + V w >= t
+    for j in range(n):
+        model.addConstr(
+            gp.quicksum(Ahat[i, j] * x[i] for i in range(m)) +
+            gp.quicksum(V[j, k] * w[k] for k in range(r))
+            >= t
+        )
+
+    t1 = time.perf_counter()
+    model.optimize()
+    t_solve = time.perf_counter() - t1
+
+    class Result: pass
+    res = Result()
+
+    res.success = model.status == GRB.OPTIMAL
+    res.status = model.status
+
+    if res.success:
+        x_vals = np.array([x[i].X for i in range(m)])
+        w_vals = np.array([w[j].X for j in range(r)])
+        t_val = t.X
+        res.x = np.concatenate([x_vals, w_vals, [t_val]])
+        res.fun = -t_val
+    else:
+        res.x = None
+        res.fun = None
+
+    return res, U, V, Ahat, t_factor, t_solve, stats
+
+def solve_sparse_factored_lp_scipy(
     F,
     x_ub=1.0,
     method="highs-ipm",
@@ -368,6 +499,61 @@ def solve_sparse_factored_lp(
     return res, U, V, Ahat, t_factor, t_solve, stats
 
 def solve_sparse_factored_lp_saved_factors(
+    F, U, V,
+    x_ub=1.0,
+):
+    m, n = F.shape
+    r = U.shape[1]
+
+    if r == 0:
+        res = solve_full_lp(F, x_ub=x_ub)
+        return res, U, V, None, 0, 0, None
+
+    Ahat = F - U @ V.T
+
+    model = gp.Model("factored_lp_saved")
+    model.setParam("OutputFlag", 0)
+
+    x = model.addVars(m, lb=0.0, ub=float(x_ub))
+    w = model.addVars(r, lb=-GRB.INFINITY)
+    t = model.addVar(lb=-GRB.INFINITY)
+
+    model.setObjective(t, GRB.MAXIMIZE)
+
+    model.addConstr(gp.quicksum(x[i] for i in range(m)) == 1.0)
+
+    for j in range(r):
+        model.addConstr(
+            gp.quicksum(U[i, j] * x[i] for i in range(m)) == w[j]
+        )
+
+    for j in range(n):
+        model.addConstr(
+            gp.quicksum(Ahat[i, j] * x[i] for i in range(m)) +
+            gp.quicksum(V[j, k] * w[k] for k in range(r))
+            >= t
+        )
+
+    model.optimize()
+
+    class Result: pass
+    res = Result()
+
+    res.success = model.status == GRB.OPTIMAL
+
+    if res.success:
+        x_vals = np.array([x[i].X for i in range(m)])
+        w_vals = np.array([w[j].X for j in range(r)])
+        t_val = t.X
+        res.x = np.concatenate([x_vals, w_vals, [t_val]])
+        res.fun = -t_val
+    else:
+        res.x = None
+        res.fun = None
+
+    return res, U, V, Ahat, 0, 0, None
+
+def solve_sparse_factored_lp_saved_factors_scipy(
     F, U, V, Ahat,
     x_ub=1.0,
     method="highs-ipm",
